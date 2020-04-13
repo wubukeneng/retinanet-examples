@@ -7,6 +7,7 @@ from apex import amp
 from apex.parallel import DistributedDataParallel as DDP
 from pycocotools.cocoeval import COCOeval
 import numpy as np
+from tqdm import tqdm
 
 from .data import DataIterator, RotatedDataIterator
 from .dali import DaliDataIterator
@@ -72,7 +73,7 @@ def infer(model, path, detections_file, resize, max_size, batch_size, mixed_prec
     results = []
     profiler = Profiler(['infer', 'fw'])
     with torch.no_grad():
-        for i, (data, ids, ratios) in enumerate(data_iterator):
+        for i, (data, ids, ratios) in enumerate(tqdm(data_iterator)):
             # Forward pass
             profiler.start('fw')
             scores, boxes, classes = model(data, rotated_bbox)

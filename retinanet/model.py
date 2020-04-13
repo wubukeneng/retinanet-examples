@@ -17,7 +17,7 @@ class Model(nn.Module):
 
     def __init__(self, backbones='ResNet50FPN', classes=80, 
                 ratios=[1.0, 2.0, 0.5], scales=[4 * 2 ** (i / 3) for i in range(3)],
-                angles=None, rotated_bbox=False, config={}):
+                angles=None, rotated_bbox=False, config={}, exporting=False):
         super().__init__()
 
         if not isinstance(backbones, list):
@@ -25,7 +25,7 @@ class Model(nn.Module):
 
         self.backbones = nn.ModuleDict({b: getattr(backbones_mod, b)() for b in backbones})
         self.name = 'RetinaNet'
-        self.exporting = False
+        self.exporting = exporting
         self.rotated_bbox = rotated_bbox
 
         self.ratios = ratios
@@ -152,6 +152,29 @@ class Model(nn.Module):
         # Perform non-maximum suppression
         decoded = [torch.cat(tensors, 1) for tensors in zip(*decoded)]
         return nms(*decoded, self.nms, self.detections)
+    
+    def post_processing(self, x, cls_heads, box_heads, threshold):
+        print(threshold)
+        global nms, generate_anchors
+        if self.rotated_bbox:
+            nms = nms_rotated
+            generate_anchors = generate_anchors_rotated
+
+        # Inference post-processing
+        decoded = []
+        for cls_head, box_head in zip(cls_heads, box_heads):
+            # Generate level's anchors
+            stride = x.shape[-1] // cls_head.shape[-1]
+            if stride not in self.anchors:
+                self.anchors[stride] = generate_anchors(stride, self.ratios, self.scales, self.angles)
+
+            # Decode and filter boxes
+            decoded.append(decode(cls_head, box_head, stride, threshold, 
+                                self.top_n, self.anchors[stride], self.rotated_bbox))
+
+        # Perform non-maximum suppression
+        decoded = [torch.cat(tensors, 1) for tensors in zip(*decoded)]
+        return nms(*decoded, self.nms, self.detections)
 
     def _extract_targets(self, targets, stride, size):
         global generate_anchors, snap_to_anchors
@@ -213,10 +236,10 @@ class Model(nn.Module):
             if key in state:
                 checkpoint[key] = state[key]
 
-        torch.save(checkpoint, state['path'])
+        torch.save(checkpoint, '{}_{}.pth'.format(state['path'], state['iteration']))
 
     @classmethod
-    def load(cls, filename, rotated_bbox=False):
+    def load(cls, filename, rotated_bbox=False, config={}, exporting=False):
         if not os.path.isfile(filename):
             raise ValueError('No checkpoint {}'.format(filename))
 
@@ -228,7 +251,7 @@ class Model(nn.Module):
         if ('angles' in checkpoint) or rotated_bbox:
             kwargs['rotated_bbox'] = True
         # Recreate model from checkpoint instead of from individual backbones
-        model = cls(backbones=checkpoint['backbone'], classes=checkpoint['classes'], **kwargs)
+        model = cls(backbones=checkpoint['backbone'], classes=checkpoint['classes'], config=config, exporting=exporting, **kwargs)
         model.load_state_dict(checkpoint['state_dict'])
 
         state = {}

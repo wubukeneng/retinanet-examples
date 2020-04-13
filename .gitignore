@@ -1,3 +1,9 @@
+checkpoints
+*.log
+logs
+pretrained
+.pth
+.ipynb_checkpoints
 .DS_Store
 __pycache__
 *.pyc

@@ -3,11 +3,13 @@ import sys
 import os
 import argparse
 import random
+import json
+
 import torch.cuda
 import torch.distributed
 import torch.multiprocessing
 
-from retinanet import infer, train, utils
+from retinanet import infer, train, utils, eval
 from retinanet.model import Model
 from retinanet._C import Engine
 
@@ -56,6 +58,8 @@ def parse(args):
     parser_train.add_argument('--logdir', metavar='logdir', type=str, help='directory where to write logs')
     parser_train.add_argument('--val-iters', metavar='number', type=int,
                               help='number of iterations between each validation', default=8000)
+    parser_train.add_argument('--save-iters', metavar='number', type=int,
+                              help='number of iterations between each save', default=1000)
     parser_train.add_argument('--with-dali', help='use dali for data loading', action='store_true')
     parser_train.add_argument('--augment-rotate', help='use four-fold rotational augmentation', action='store_true')
     parser_train.add_argument('--augment-brightness', metavar='value', type=float,
@@ -70,6 +74,7 @@ def parse(args):
                               default=0.0001)
     parser_train.add_argument('--rotated-bbox', help='detect rotated bounding boxes [x, y, w, h, theta]',
                               action='store_true')
+    parser_train.add_argument('--config', metavar='config', type=str, help='config file path')
 
     parser_infer = subparsers.add_parser('infer', help='run inference')
     parser_infer.add_argument('model', type=str, help='path to model')
@@ -85,6 +90,23 @@ def parse(args):
     parser_infer.add_argument('--full-precision', help='inference in full precision', action='store_true')
     parser_infer.add_argument('--rotated-bbox', help='inference using a rotated bounding box model',
                               action='store_true')
+    parser_infer.add_argument('--config', metavar='config', type=str, help='config file path')
+    
+    parser_eval = subparsers.add_parser('eval', help='run eval')
+    parser_eval.add_argument('model', type=str, help='path to model')
+    parser_eval.add_argument('--images', metavar='path', type=str, help='path to images', default='.')
+    parser_eval.add_argument('--annotations', metavar='annotations', type=str,
+                              help='evaluate using provided annotations')
+    parser_eval.add_argument('--output', metavar='file', type=str, help='save detections to specified JSON file',
+                              default='detections.json')
+    parser_eval.add_argument('--batch', metavar='size', type=int, help='batch size', default=2 * devcount)
+    parser_eval.add_argument('--resize', metavar='scale', type=int, help='resize to given size', default=800)
+    parser_eval.add_argument('--max-size', metavar='max', type=int, help='maximum resizing size', default=1333)
+    parser_eval.add_argument('--with-dali', help='use dali for data loading', action='store_true')
+    parser_eval.add_argument('--full-precision', help='inference in full precision', action='store_true')
+    parser_eval.add_argument('--rotated-bbox', help='inference using a rotated bounding box model',
+                              action='store_true')
+    parser_eval.add_argument('--config', metavar='config', type=str, help='config file path')
 
     parser_export = subparsers.add_parser('export', help='export a model into a TensorRT engine')
     parser_export.add_argument('model', type=str, help='path to model')
@@ -111,22 +133,33 @@ def parse(args):
 
 
 def load_model(args, verbose=False):
+    config = {}
+    
+    if args.config:
+        with open(args.config, 'r') as config_file:
+            config = json.load(config_file)
+    
     if args.command != 'train' and not os.path.isfile(args.model):
         raise RuntimeError('Model file {} does not exist!'.format(args.model))
 
     model = None
     state = {}
-    _, ext = os.path.splitext(args.model)
+    model_name, ext = os.path.splitext(args.model)
 
     if args.command == 'train' and (not os.path.exists(args.model) or args.override):
         if verbose: print('Initializing model...')
-        model = Model(backbones=args.backbone, classes=args.classes, rotated_bbox=args.rotated_bbox)
+        model = Model(backbones=args.backbone, classes=args.classes, rotated_bbox=args.rotated_bbox, config=config)
         model.initialize(args.fine_tune)
         if verbose: print(model)
 
     elif ext == '.pth' or ext == '.torch':
         if verbose: print('Loading model from {}...'.format(os.path.basename(args.model)))
-        model, state = Model.load(filename=args.model, rotated_bbox=args.rotated_bbox)
+        
+        exporting = False
+        if args.command == 'eval':
+            exporting = True
+            
+        model, state = Model.load(filename=args.model, rotated_bbox=args.rotated_bbox, config=config, exporting=exporting)
         if verbose: print(model)
 
     elif args.command == 'infer' and ext in ['.engine', '.plan']:
@@ -135,7 +168,7 @@ def load_model(args, verbose=False):
     else:
         raise RuntimeError('Invalid model format "{}"!'.format(args.ext))
 
-    state['path'] = args.model
+    state['path'] = model_name
     return model, state
 
 
@@ -163,7 +196,7 @@ def worker(rank, args, world, model, state):
     if args.command == 'train':
         train.train(model, state, args.images, args.annotations,
                     args.val_images or args.images, args.val_annotations, args.resize, args.max_size, args.jitter,
-                    args.batch, int(args.iters * args.schedule), args.val_iters, not args.full_precision, args.lr,
+                    args.batch, int(args.iters * args.schedule), args.val_iters, args.save_iters, not args.full_precision, args.lr,
                     args.warmup, [int(m * args.schedule) for m in args.milestones], args.gamma,
                     is_master=(rank == 0), world=world, use_dali=args.with_dali,
                     metrics_url=args.post_metrics, logdir=args.logdir, verbose=(rank == 0),
@@ -181,7 +214,17 @@ def worker(rank, args, world, model, state):
                     annotations=args.annotations, mixed_precision=not args.full_precision,
                     is_master=(rank == 0), world=world, use_dali=args.with_dali, verbose=(rank == 0),
                     rotated_bbox=args.rotated_bbox)
+        
+    elif args.command == 'eval':
+        if model is None:
+            if rank == 0: print('Loading CUDA engine from {}...'.format(os.path.basename(args.model)))
+            model = Engine.load(args.model)
 
+        eval.eval(model, args.images, args.output, args.resize, args.max_size, args.batch,
+                    annotations=args.annotations, mixed_precision=not args.full_precision,
+                    is_master=(rank == 0), world=world, use_dali=args.with_dali, verbose=(rank == 0),
+                    rotated_bbox=args.rotated_bbox)
+        
     elif args.command == 'export':
         onnx_only = args.export.split('.')[-1] == 'onnx'
         input_size = args.size * 2 if len(args.size) == 1 else args.size

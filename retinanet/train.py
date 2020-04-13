@@ -14,7 +14,7 @@ from .infer import infer
 
 
 def train(model, state, path, annotations, val_path, val_annotations, resize, max_size, jitter, batch_size, iterations,
-          val_iterations, mixed_precision, lr, warmup, milestones, gamma, is_master=True, world=1, use_dali=True,
+          val_iterations, save_iterations, mixed_precision, lr, warmup, milestones, gamma, is_master=True, world=1, use_dali=True,
           verbose=True, metrics_url=None, logdir=None, rotate_augment=False, augment_brightness=0.0,
           augment_contrast=0.0, augment_hue=0.0, augment_saturation=0.0, regularization_l2=0.0001, rotated_bbox=False):
     'Train the model on the given dataset'
@@ -124,6 +124,17 @@ def train(model, state, path, annotations, val_path, val_annotations, resize, ma
 
             iteration += 1
             profiler.bump('train')
+            
+            if is_master and (iteration%save_iterations == 0):
+                # Save model weights
+                state.update({
+                    'iteration': iteration,
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                })
+                with ignore_sigint():
+                    nn_model.save(state)
+                    
             if is_master and (profiler.totals['train'] > 60 or iteration == iterations):
                 focal_loss = torch.stack(list(cls_losses)).mean().item()
                 box_loss = torch.stack(list(box_losses)).mean().item()
@@ -151,15 +162,6 @@ def train(model, state, path, annotations, val_path, val_annotations, resize, ma
                         'im_s': batch_size / profiler.means['train'],
                         'lr': learning_rate
                     })
-
-                # Save model weights
-                state.update({
-                    'iteration': iteration,
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict(),
-                })
-                with ignore_sigint():
-                    nn_model.save(state)
 
                 profiler.reset()
                 del cls_losses[:], box_losses[:]
