@@ -11,7 +11,6 @@ from .box import generate_anchors, snap_to_anchors, decode, nms
 from .box import generate_anchors_rotated, snap_to_anchors_rotated, nms_rotated
 from .loss import FocalLoss, SmoothL1Loss
 
-
 class Model(nn.Module):
     'RetinaNet - https://arxiv.org/abs/1708.02002'
 
@@ -21,7 +20,7 @@ class Model(nn.Module):
         super().__init__()
 
         if not isinstance(backbones, list):
-            backbones = [backbones]
+            backbones = [backbones] 
 
         self.backbones = nn.ModuleDict({b: getattr(backbones_mod, b)() for b in backbones})
         self.name = 'RetinaNet'
@@ -67,6 +66,9 @@ class Model(nn.Module):
         ])
 
     def initialize(self, pre_trained):
+        backbone_arr = list(self.backbones.keys())[0].rsplit('_', 1)
+        mod = True if len(backbone_arr) > 1 else False
+        
         if pre_trained:
             # Initialize using weights from pre-trained model
             if not os.path.isfile(pre_trained):
@@ -78,9 +80,21 @@ class Model(nn.Module):
             ignored = ['cls_head.8.bias', 'cls_head.8.weight']
             if self.rotated_bbox:
                 ignored += ['box_head.8.bias', 'box_head.8.weight']
-            weights = {k: v for k, v in chk['state_dict'].items() if k not in ignored}
+            
+            if mod:
+                weights = {}
+                for k, v in chk['state_dict'].items():
+                    if backbone_arr[0] in k:
+                        k_arr = k.split(backbone_arr[0])
+                        mod_k = '{}{}_Mod{}'.format(k_arr[0], backbone_arr[0], k_arr[1])
+                        
+                        if k not in ignored:
+                            weights[mod_k] = v
+            else:
+                weights = {k: v for k, v in chk['state_dict'].items() if k not in ignored}
+                
             state_dict.update(weights)
-            self.load_state_dict(state_dict)
+            self.load_state_dict(state_dict, strict=False)
 
             del chk, weights
             torch.cuda.empty_cache()
