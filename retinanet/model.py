@@ -16,7 +16,7 @@ class Model(nn.Module):
 
     def __init__(self, backbones='ResNet50FPN', classes=80, 
                 ratios=[1.0, 2.0, 0.5], scales=[4 * 2 ** (i / 3) for i in range(3)],
-                angles=None, rotated_bbox=False, config={}, exporting=False):
+                angles=None, rotated_bbox=False, config={}, exporting=False, global=False, global_classes=2):
         super().__init__()
 
         if not isinstance(backbones, list):
@@ -54,6 +54,16 @@ class Model(nn.Module):
         self.cls_head = make_head(classes * self.num_anchors)
         self.box_head = make_head(4 * self.num_anchors) if not self.rotated_bbox \
                         else make_head(6 * self.num_anchors)  # theta -> cos(theta), sin(theta)
+        
+        # global classification supervision
+        self.global = global
+        self.global_classes = global_classes
+        
+        if self.global:
+            self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+            self.global_fc = nn.Linear(256, self.global_classes)
+            
+            self.global_criterion = FocalLoss()
 
         self.cls_criterion = FocalLoss()
         self.box_criterion = SmoothL1Loss(beta=0.11)
@@ -75,8 +85,11 @@ class Model(nn.Module):
                 raise ValueError('No checkpoint {}'.format(pre_trained))
 
             print('Fine-tuning weights from {}...'.format(os.path.basename(pre_trained)))
+            
             state_dict = self.state_dict()
             chk = torch.load(pre_trained, map_location=lambda storage, loc: storage)
+            
+            # TODO : ignore global fc
             ignored = ['cls_head.8.bias', 'cls_head.8.weight']
             if self.rotated_bbox:
                 ignored += ['box_head.8.bias', 'box_head.8.weight']
@@ -124,9 +137,16 @@ class Model(nn.Module):
         self.cls_head[-1].apply(initialize_prior)
         if self.rotated_bbox:
             self.box_head[-1].apply(initialize_prior)
+        
+        # we are using focal loss for global cls prediction
+        self.global_fc.apply(initialize_prior)
 
     def forward(self, x, rotated_bbox=None):
-        if self.training: x, targets = x
+        if self.training:
+            if not self.global:
+                x, targets = x
+            else:
+                x, targets, g_targets = x
 
         # Backbones forward pass
         features = []
@@ -136,9 +156,18 @@ class Model(nn.Module):
         # Heads forward pass
         cls_heads = [self.cls_head(t) for t in features]
         box_heads = [self.box_head(t) for t in features]
+        
+        # calc global head on p7
+        if self.global:
+            global_pools = [self.global_pool(t[-1]) for t in features]
+            global_pools = [global_pool.view(-1, 256) for global_pool in global_pools]
+            global_cls = [self.global_fc(p) for p in global_pools]
 
         if self.training:
-            return self._compute_loss(x, cls_heads, box_heads, targets.float())
+            if self.global:
+                return self._compute_loss(x, cls_heads, box_heads, targets.float(), global_cls=global_cls, g_targets=g_targets)
+            else:
+                return self._compute_loss(x, cls_heads, box_heads, targets.float())
 
         cls_heads = [cls_head.sigmoid() for cls_head in cls_heads]
 
@@ -168,7 +197,6 @@ class Model(nn.Module):
         return nms(*decoded, self.nms, self.detections)
     
     def post_processing(self, x, cls_heads, box_heads, threshold):
-        print(threshold)
         global nms, generate_anchors
         if self.rotated_bbox:
             nms = nms_rotated
@@ -209,8 +237,9 @@ class Model(nn.Module):
             for l, s in zip((cls_target, box_target, depth), snapped): l.append(s)
         return torch.stack(cls_target), torch.stack(box_target), torch.stack(depth)
 
-    def _compute_loss(self, x, cls_heads, box_heads, targets):
+    def _compute_loss(self, x, cls_heads, box_heads, targets, global_cls=None, g_targets=None):
         cls_losses, box_losses, fg_targets = [], [], []
+            
         for cls_head, box_head in zip(cls_heads, box_heads):
             size = cls_head.shape[-2:]
             stride = x.shape[-1] / cls_head.shape[-1]
@@ -233,6 +262,18 @@ class Model(nn.Module):
         fg_targets = torch.stack(fg_targets).sum()
         cls_loss = torch.stack(cls_losses).sum() / fg_targets
         box_loss = torch.stack(box_losses).sum() / fg_targets
+        
+        if global_cls is not None:
+            global_losses = []
+            
+            for global_head in global_cls:
+                global_loss = self.global_criterion(global_head, g_targets)
+                global_losses.append(global_loss.mean())
+                
+            global_loss = torch.stask(global_losses).mean()
+            
+            return cls_loss, box_loss, global_loss
+        
         return cls_loss, box_loss
 
     def save(self, state):

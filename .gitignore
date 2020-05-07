@@ -2,7 +2,7 @@ checkpoints
 *.log
 logs
 pretrained
-.pth
+*.pth
 .ipynb_checkpoints
 .DS_Store
 __pycache__

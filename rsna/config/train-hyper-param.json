@@ -1,0 +1,7 @@
+{
+    "threshold": 0.01,
+    "top_n": 1000,
+    "nms": 0.0,
+    "detections": 4,
+    "exporting": false
+}
