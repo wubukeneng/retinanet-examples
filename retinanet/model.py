@@ -16,7 +16,7 @@ class Model(nn.Module):
 
     def __init__(self, backbones='ResNet50FPN', classes=80, 
                 ratios=[1.0, 2.0, 0.5], scales=[4 * 2 ** (i / 3) for i in range(3)],
-                angles=None, rotated_bbox=False, config={}, exporting=False, global=False, global_classes=2):
+                angles=None, rotated_bbox=False, config={}, exporting=False, global_cls=False, global_classes=2):
         super().__init__()
 
         if not isinstance(backbones, list):
@@ -56,10 +56,10 @@ class Model(nn.Module):
                         else make_head(6 * self.num_anchors)  # theta -> cos(theta), sin(theta)
         
         # global classification supervision
-        self.global = global
+        self.global_cls = global_cls
         self.global_classes = global_classes
         
-        if self.global:
+        if self.global_cls:
             self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
             self.global_fc = nn.Linear(256, self.global_classes)
             
@@ -139,11 +139,12 @@ class Model(nn.Module):
             self.box_head[-1].apply(initialize_prior)
         
         # we are using focal loss for global cls prediction
-        self.global_fc.apply(initialize_prior)
+        if self.global_cls:
+            self.global_fc.apply(initialize_prior)
 
     def forward(self, x, rotated_bbox=None):
         if self.training:
-            if not self.global:
+            if not self.global_cls:
                 x, targets = x
             else:
                 x, targets, g_targets = x
@@ -158,13 +159,13 @@ class Model(nn.Module):
         box_heads = [self.box_head(t) for t in features]
         
         # calc global head on p7
-        if self.global:
+        if self.global_cls:
             global_pools = [self.global_pool(t[-1]) for t in features]
             global_pools = [global_pool.view(-1, 256) for global_pool in global_pools]
             global_cls = [self.global_fc(p) for p in global_pools]
 
         if self.training:
-            if self.global:
+            if self.global_cls:
                 return self._compute_loss(x, cls_heads, box_heads, targets.float(), global_cls=global_cls, g_targets=g_targets)
             else:
                 return self._compute_loss(x, cls_heads, box_heads, targets.float())
